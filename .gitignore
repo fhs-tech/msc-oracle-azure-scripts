@@ -1,0 +1,74 @@
+# OS files
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+Icon?
+
+# Editor/IDE directories
+.vscode/
+.idea/
+*.iml
+
+# Vim/Emacs swap/backup files
+*.swp
+*.swo
+*~
+.#*
+*.un~
+\#*\#
+
+# Logs
+logs/
+*.log
+*.log.*
+log.txt
+
+# Environment files
+.env
+.env.*
+!.env.example
+.envrc
+
+# Caches and temp
+.cache/
+.tmp/
+temp/
+tmp/
+*.tmp
+
+# Archives
+*.tar
+*.gz
+*.tgz
+*.zip
+*.7z
+*.xz
+*.bz2
+*.rar
+
+# Backups/patch artifacts
+*.bak
+*.old
+*.orig
+*.rej
+
+# Keys and certificates (avoid committing secrets)
+*.pem
+*.key
+*.crt
+*.der
+*.p12
+
+# Database/dump and trace files
+*.dmp
+*.dbf
+*.trc
+*.aud
+
+
+
+# Standby runtime directories
+out/
+tracking/
+log/
