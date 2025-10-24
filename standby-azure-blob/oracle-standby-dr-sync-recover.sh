@@ -1,9 +1,6 @@
 #!/bin/bash
 #================================================================
 # Script: oracle-standby-dr-sync-recover.sh
-# Descrição: Download archives e execução de recovery manual
-# Servidor: DR1 / DR2 - Oracle Standard Edition (Standby Manual)
-# Execução: A cada 10-15 minutos via cron
 #================================================================
 
 . ~/.bash_profile

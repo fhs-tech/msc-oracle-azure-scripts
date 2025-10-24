@@ -6,17 +6,10 @@
 # Variáveis de ambiente
 # ==============================
 
-FILE_NAME="oracle_standby_dr_monitor"
+FILE_NAME="standby_monitor"
 SID=${ORACLE_SID^^}
 DT=$(date +%d-%m-%Y_%H%M)
 RUN_ID=$(echo "$$-$(date +%s)" | md5sum | cut -c1-8)
-
-# Configuração do DATABASE_NAME para diferenciar DR1/DR2
-DATABASE_NAME=${DATABASE_NAME:-"DR1"}
-if [[ -z "$DATABASE_NAME" ]]; then
-    echo "ERRO: DATABASE_NAME deve ser definida (DR1, DR2, etc)"
-    exit 1
-fi
 
 # Diretórios e arquivos
 STANDBY_DIR="/u01/scripts/standby"
@@ -27,8 +20,13 @@ SUMMARY_LOG="${LOG_DIR}/monitor_${SID}.log"
 
 # Arquivos de monitoramento
 LOCK_FILE="/tmp/${FILE_NAME}_${SID}.lock"
-ZABBIX_MONITOR="/opt/discover/zabbix/${FILE_NAME}_${SID}.out"
-MONITOR_JSON="/opt/discover/zabbix/standby_monitor_${SID}_${DATABASE_NAME}.json"
+
+ZABBIX_MONITOR_DIR="/opt/discover/zabbix"
+ZABBIX_MONITOR="${ZABBIX_MONITOR_DIR}/standby_last_sequence_applied_${SID}.out"
+ZABBIX_LAST_SYNC="${ZABBIX_MONITOR_DIR}/standby_last_download_arch_min_${SID}.out"
+MONITOR_JSON="${ZABBIX_MONITOR_DIR}/${FILE_NAME}_${SID}.json"
+
+ARCHIVELOG_DEST="/u02/fra/MSCDBPR/archivelog/"
 
 # Configurações de alerta
 SEQUENCE_GAP_THRESHOLD=10
@@ -50,12 +48,12 @@ fi
 
 touch "$LOCK_FILE"
 
-trap 'handle_exit' EXIT SIGINT SIGTERM SIGHUP
+trap 'handle_interrupt' SIGINT SIGTERM SIGHUP
 
-handle_exit() {
-    echo "$(date '+%d-%m-%Y %H:%M:%S') - [TRAP] Script interrompido ou finalizado. Removendo lock..." | tee -a "$LOG_FILE"
-    rm -f "$LOCK_FILE"
+handle_interrupt() {
+    echo "$(date '+%d-%m-%Y %H:%M:%S') - [TRAP] Script interrompido por sinal. Removendo lock..." | tee -a "$LOG_FILE"
     echo 1 > "$ZABBIX_MONITOR"
+    rm -f "$LOCK_FILE"
     exit 1
 }
 
@@ -70,14 +68,11 @@ log() {
 # Obter sequência atual da produção
 get_production_sequence() {
     local result
-    result=$(sqlplus -silent "${PROD_CONNECTION}" <<EOF | grep -v '^$' | tail -1
+    result=$(sqlplus -silent "${PROD_CONNECTION}" <<EOF 2>/dev/null | grep -v '^$' | tail -1
 SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
 SELECT TRIM(max(l.sequence#))
-FROM v\\$log_history l, v\\$database d, v\\$thread t
-WHERE d.resetlogs_change# = l.resetlogs_change#
-AND t.thread# = l.thread#
-GROUP BY l.thread#, d.resetlogs_change#
-ORDER BY l.thread#;
+FROM v\$log_history l, v\$database d
+WHERE d.resetlogs_change# = l.resetlogs_change#;
 EXIT;
 EOF
 )
@@ -85,7 +80,7 @@ EOF
     if [[ $? -eq 0 ]] && [[ "$result" =~ ^[0-9]+$ ]]; then
         echo "$result"
     else
-        log "ERRO: Falha ao obter sequência da produção"
+        echo "$(date '+%d-%m-%Y %H:%M:%S') - ERRO: Falha ao obter sequência da produção" | tee -a "$LOG_FILE" >&2
         echo "0"
     fi
 }
@@ -95,8 +90,9 @@ get_dr_sequence() {
     local result
     result=$(sqlplus -silent / as sysdba <<EOF | grep -v '^$' | tail -1
 SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
-SELECT NVL(MAX(SEQUENCE#), 0)
-FROM V\\$LOG_HISTORY;
+SELECT TRIM(max(l.sequence#))
+FROM v\$log_history l, v\$database d
+WHERE d.resetlogs_change# = l.resetlogs_change#;
 EXIT;
 EOF
 )
@@ -104,7 +100,7 @@ EOF
     if [[ $? -eq 0 ]] && [[ "$result" =~ ^[0-9]+$ ]]; then
         echo "$result"
     else
-        log "ERRO: Falha ao obter sequência do DR"
+        echo "$(date '+%d-%m-%Y %H:%M:%S') - ERRO: Falha ao obter sequência do DR" | tee -a "$LOG_FILE" >&2
         echo "0"
     fi
 }
@@ -141,7 +137,7 @@ EOF
 
 # Verificar uso de disco do diretório de archives
 get_disk_usage() {
-    local archive_dir="/u01/app/oracle/archives_standby"
+    local archive_dir="${ARCHIVELOG_DEST}"
     if [[ -d "$archive_dir" ]]; then
         df "$archive_dir" | awk 'NR==2 {print $5}' | sed 's/%//'
     else
@@ -149,23 +145,43 @@ get_disk_usage() {
     fi
 }
 
-# Verificar última execução dos scripts de sync
-check_sync_scripts_status() {
-    local upload_log="/u01/scripts/standby/log/upload_blob_${SID}.log"
-    local download_log="/u01/app/oracle/admin/logs/download_blob_${SID}.log"
-
-    local last_upload="-"
+# Verificar última execução do script de download (executado localmente no DR)
+check_last_download() {
+    local download_log="${LOG_DIR}/dr_sync_recover_${SID}.log"
     local last_download="-"
-
-    if [[ -f "$upload_log" ]]; then
-        last_upload=$(tail -1 "$upload_log" 2>/dev/null | cut -d'|' -f1 | head -1)
-    fi
 
     if [[ -f "$download_log" ]]; then
         last_download=$(tail -1 "$download_log" 2>/dev/null | cut -d'|' -f1 | head -1)
     fi
 
-    echo "${last_upload}|${last_download}"
+    echo "${last_download}"
+}
+
+# Calcular minutos desde o último download
+get_minutes_since_last_download() {
+    local last_download_ts="$1"
+
+    # Se não há timestamp, retornar -1 (indicando sem dados)
+    if [[ -z "$last_download_ts" ]] || [[ "$last_download_ts" == "-" ]]; then
+        echo "-1"
+        return
+    fi
+
+    # Converter timestamp para epoch
+    local last_epoch=$(date -d "$last_download_ts" +%s 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
+        echo "-1"
+        return
+    fi
+
+    # Timestamp atual
+    local now_epoch=$(date +%s)
+
+    # Calcular diferença em minutos
+    local diff_seconds=$((now_epoch - last_epoch))
+    local diff_minutes=$((diff_seconds / 60))
+
+    echo "$diff_minutes"
 }
 
 # Gerar arquivo JSON de monitoramento
@@ -176,25 +192,24 @@ generate_monitor_json() {
     local prod_conn=$4
     local dr_conn=$5
     local disk_usage=$6
-    local sync_status=$7
+    local last_download=$7
     local overall_status=$8
 
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local last_upload=$(echo "$sync_status" | cut -d'|' -f1)
-    local last_download=$(echo "$sync_status" | cut -d'|' -f2)
 
     cat > "$MONITOR_JSON" <<EOF
 {
   "timestamp": "${timestamp}",
-  "database_name": "${DATABASE_NAME}",
+  "database_name": "${SID}",
   "sid": "${SID}",
   "prod_sequence": ${prod_seq},
   "dr_sequence": ${dr_seq},
   "sequence_gap": ${gap},
+  "gap_threshold": ${SEQUENCE_GAP_THRESHOLD},
   "connectivity_prod": "${prod_conn}",
   "connectivity_dr": "${dr_conn}",
   "disk_usage_pct": ${disk_usage},
-  "last_sync_upload": "${last_upload}",
+  "disk_threshold_pct": ${DISK_USAGE_THRESHOLD},
   "last_sync_download": "${last_download}",
   "status": "${overall_status}"
 }
@@ -204,7 +219,7 @@ EOF
 # Função principal
 main() {
     log "=========================================="
-    log "Início do monitoramento DR: ${DATABASE_NAME}"
+    log "Início do monitoramento DR: ${SID}"
     log "=========================================="
 
     # 1. Verificar conectividade
@@ -231,9 +246,13 @@ main() {
     disk_usage=$(get_disk_usage)
     log "Uso de disco: ${disk_usage}%"
 
-    # 5. Status dos scripts de sync
-    sync_status=$(check_sync_scripts_status)
-    log "Status dos scripts de sync: ${sync_status}"
+    # 5. Verificar última execução do download
+    last_download=$(check_last_download)
+    log "Último download: ${last_download}"
+
+    # Calcular minutos desde último download
+    minutes_since_download=$(get_minutes_since_last_download "$last_download")
+    log "Minutos desde último download: ${minutes_since_download}"
 
     # 6. Determinar status geral
     overall_status="OK"
@@ -251,18 +270,19 @@ main() {
     # 7. Gerar arquivo JSON de monitoramento
     generate_monitor_json "$prod_sequence" "$dr_sequence" "$sequence_gap" \
                          "$prod_connectivity" "$dr_connectivity" "$disk_usage" \
-                         "$sync_status" "$overall_status"
+                         "$last_download" "$overall_status"
 
-    # 8. Manter compatibilidade com arquivo .out original para Zabbix
-    if [[ "$overall_status" == "OK" ]]; then
-        echo "0" > "$ZABBIX_MONITOR"
-    else
-        echo "1" > "$ZABBIX_MONITOR"
-    fi
+    # 8. Escrever o valor do gap no arquivo Zabbix para monitoramento
+    # O Zabbix pode usar este valor numérico para criar alertas (ex: gap > 10)
+    echo "${sequence_gap}" > "$ZABBIX_MONITOR"
 
-    # 9. Summary log
+    # 9. Escrever minutos desde último download no arquivo Zabbix
+    # O Zabbix pode usar este valor para alertar se download está atrasado (ex: > 30 minutos)
+    echo "${minutes_since_download}" > "$ZABBIX_LAST_SYNC"
+
+    # 10. Summary log
     now_ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "${now_ts}|RUN_ID=${RUN_ID}|DB=${DATABASE_NAME}|PROD=${prod_sequence}|DR=${dr_sequence}|GAP=${sequence_gap}|DISK=${disk_usage}%|STATUS=${overall_status}" >> "$SUMMARY_LOG"
+    echo "${now_ts}|RUN_ID=${RUN_ID}|DB=${SID}|PROD=${prod_sequence}|DR=${dr_sequence}|GAP=${sequence_gap}|MINUTES=${minutes_since_download}|DISK=${disk_usage}%|STATUS=${overall_status}" >> "$SUMMARY_LOG"
 
     log "Monitoramento finalizado"
     log "=========================================="
@@ -273,3 +293,6 @@ main() {
 
 # Executar
 main
+
+## Enviar para o Zabbix
+/opt/discover/zabbix/scripts/send_sync_zabbix.sh
