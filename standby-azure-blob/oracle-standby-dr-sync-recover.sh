@@ -276,8 +276,8 @@ cleanup_old_files() {
     # Obter última sequência aplicada uma única vez
     local last_applied=$(get_last_applied_sequence)
 
-    # Remover archives aplicados com mais de 3 dias
-    find ${ARCHIVELOG_DEST} -name "*.dbf" -mtime +3 -type f | while read archive_file; do
+    # Remover archives aplicados com mais de 2 dias
+    find ${ARCHIVELOG_DEST} -name "*.dbf" -mtime +2 -type f | while read archive_file; do
         archive_name=$(basename -- "${archive_file}")
         sequence=$(echo ${archive_name} | cut -d'_' -f2)
 
